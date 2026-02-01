@@ -1,0 +1,2 @@
+# analyze_google_drive_duplicates
+Google雲端硬碟內重複檔案檢查
