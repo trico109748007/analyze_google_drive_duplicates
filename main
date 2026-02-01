@@ -1,60 +1,79 @@
-function scanAllFoldersForDuplicates() {
+function scanDuplicatesWithNamingAndSize() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName('全硬碟重複檢查');
-  if (sheet) { sheet.clear(); } else { sheet = ss.insertSheet('全硬碟重複檢查'); }
+  let sheet = ss.getSheetByName('副本比對清單');
+  if (sheet) { sheet.clear(); } else { sheet = ss.insertSheet('副本比對清單'); }
 
-  // 設定標題
-  sheet.appendRow(["狀態", "資料夾路徑", "檔案名稱", "檔案大小 (Bytes)", "MD5 雜湊值", "建立時間", "檔案連結"]);
-  sheet.getRange(1, 1, 1, 7).setFontWeight("bold").setBackground("#f3f3f3");
+  // 1. 設定標題列
+  sheet.appendRow(["狀態", "資料夾路徑", "副本檔名", "原始檔名", "大小是否一致", "副本大小", "原始大小", "副本建立時間", "副本連結"]);
+  sheet.getRange(1, 1, 1, 9).setFontWeight("bold").setBackground("#f3f3f3");
 
-  const fileMap = {}; // 用於記錄： ParentID_MD5_Size
-  
-  // 從根目錄開始遞迴掃描
   const root = DriveApp.getRootFolder();
-  processFolder(root, "/", fileMap, sheet);
+  processFolder(root, "/", sheet);
 
-  sheet.autoResizeColumns(1, 7);
+  sheet.autoResizeColumns(1, 9);
   SpreadsheetApp.getUi().alert("掃描完成！");
 }
 
-/**
- * 遞迴處理資料夾函數
- */
-function processFolder(folder, path, fileMap, sheet) {
-  const folderId = folder.getId();
+function processFolder(folder, path, sheet) {
   const files = folder.getFiles();
+  const fileArray = [];
+  const fileDataMap = {}; // 用來存儲檔名對應的檔案資訊
 
+  // 1. 先讀取該資料夾所有檔案，建立快速索引
   while (files.hasNext()) {
-    const file = files.next();
-    const name = file.getName();
-    const size = file.getSize();
-    const date = file.getDateCreated();
-    const url = file.getUrl();
+    let file = files.next();
+    let name = file.getName();
+    let size = file.getSize();
     
-    // 取得 MD5 雜湊值 (Google 格式檔案如 Doc/Sheet 可能無法取得，給予預設值)
-    let md5 = "";
-    try {
-      md5 = file.getBlob().getHash();
-    } catch (e) {
-      md5 = "GOOGLE_FORMAT";
-    }
-
-    // 關鍵邏輯：唯一鍵值包含 FolderID，確保只有「同資料夾內」且「內容相同」才會判定為重複
-    const signature = folderId + "_" + md5 + "_" + size;
-
-    if (fileMap[signature]) {
-      sheet.appendRow(["重複副本", path, name, size, md5, date, url]);
-    } else {
-      fileMap[signature] = true;
-      // 若想連原始檔案都列出來以便比對，可取消下行註解
-      // sheet.appendRow(["原始檔案", path, name, size, md5, date, url]);
-    }
+    fileArray.push(file);
+    // 儲存原始檔資訊 (以檔名為 Key)
+    fileDataMap[name] = {
+      size: size,
+      id: file.getId()
+    };
   }
 
-  // 遞迴處理子資料夾
+  // 2. 比對副本模式
+  fileArray.forEach(file => {
+    const fileName = file.getName();
+    const fileSize = file.getSize();
+    const fileId = file.getId();
+
+    // 正規表達式：匹配 "檔名 (1)", "檔名 (2)", "檔名 的副本"
+    const match = fileName.match(/^(.*)\s\(\d+\)$/) || fileName.match(/^(.*) 的副本$/);
+
+    if (match) {
+      const baseName = match[1]; // 取得括號前的原始名稱
+
+      // 檢查同目錄下是否存在「原始檔名」的檔案
+      if (fileDataMap[baseName]) {
+        const originalFile = fileDataMap[baseName];
+        
+        // 判斷大小是否一致
+        const isSizeSame = (fileSize === originalFile.size) ? "一致" : "不一致";
+        const sizeDisplay = (fileSize === 0 && file.getMimeType().includes("google-apps")) ? "-" : fileSize;
+        const originSizeDisplay = (originalFile.size === 0) ? "-" : originalFile.size;
+
+        // 寫入結果
+        sheet.appendRow([
+          "偵測到副本",
+          path,
+          fileName,
+          baseName,
+          isSizeSame,
+          sizeDisplay,
+          originSizeDisplay,
+          file.getDateCreated(),
+          file.getUrl()
+        ]);
+      }
+    }
+  });
+
+  // 3. 遞迴處理子資料夾
   const subFolders = folder.getFolders();
   while (subFolders.hasNext()) {
     const subFolder = subFolders.next();
-    processFolder(subFolder, path + subFolder.getName() + "/", fileMap, sheet);
+    processFolder(subFolder, path + subFolder.getName() + "/", sheet);
   }
 }
