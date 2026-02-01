@@ -1,0 +1,79 @@
+// function scanDuplicatesWithNamingAndSize() {
+//   const ss = SpreadsheetApp.getActiveSpreadsheet();
+//   let sheet = ss.getSheetByName('副本比對清單');
+//   if (sheet) { sheet.clear(); } else { sheet = ss.insertSheet('副本比對清單'); }
+
+//   // 1. 設定標題列
+//   sheet.appendRow(["狀態", "資料夾路徑", "副本檔名", "原始檔名", "大小是否一致", "副本大小", "原始大小", "副本建立時間", "副本連結"]);
+//   sheet.getRange(1, 1, 1, 9).setFontWeight("bold").setBackground("#f3f3f3");
+
+//   const root = DriveApp.getRootFolder();
+//   processFolder(root, "/", sheet);
+
+//   sheet.autoResizeColumns(1, 9);
+//   SpreadsheetApp.getUi().alert("掃描完成！");
+// }
+
+// function processFolder(folder, path, sheet) {
+//   const files = folder.getFiles();
+//   const fileArray = [];
+//   const fileDataMap = {}; // 用來存儲檔名對應的檔案資訊
+
+//   // 1. 先讀取該資料夾所有檔案，建立快速索引
+//   while (files.hasNext()) {
+//     let file = files.next();
+//     let name = file.getName();
+//     let size = file.getSize();
+    
+//     fileArray.push(file);
+//     // 儲存原始檔資訊 (以檔名為 Key)
+//     fileDataMap[name] = {
+//       size: size,
+//       id: file.getId()
+//     };
+//   }
+
+//   // 2. 比對副本模式
+//   fileArray.forEach(file => {
+//     const fileName = file.getName();
+//     const fileSize = file.getSize();
+//     const fileId = file.getId();
+
+//     // 正規表達式：匹配 "檔名 (1)", "檔名 (2)", "檔名 的副本"
+//     const match = fileName.match(/^(.*)\s\(\d+\)$/) || fileName.match(/^(.*) 的副本$/);
+
+//     if (match) {
+//       const baseName = match[1]; // 取得括號前的原始名稱
+
+//       // 檢查同目錄下是否存在「原始檔名」的檔案
+//       if (fileDataMap[baseName]) {
+//         const originalFile = fileDataMap[baseName];
+        
+//         // 判斷大小是否一致
+//         const isSizeSame = (fileSize === originalFile.size) ? "一致" : "不一致";
+//         const sizeDisplay = (fileSize === 0 && file.getMimeType().includes("google-apps")) ? "-" : fileSize;
+//         const originSizeDisplay = (originalFile.size === 0) ? "-" : originalFile.size;
+
+//         // 寫入結果
+//         sheet.appendRow([
+//           "偵測到副本",
+//           path,
+//           fileName,
+//           baseName,
+//           isSizeSame,
+//           sizeDisplay,
+//           originSizeDisplay,
+//           file.getDateCreated(),
+//           file.getUrl()
+//         ]);
+//       }
+//     }
+//   });
+
+//   // 3. 遞迴處理子資料夾
+//   const subFolders = folder.getFolders();
+//   while (subFolders.hasNext()) {
+//     const subFolder = subFolders.next();
+//     processFolder(subFolder, path + subFolder.getName() + "/", sheet);
+//   }
+// }
