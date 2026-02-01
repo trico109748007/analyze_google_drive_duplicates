@@ -1,0 +1,252 @@
+/**
+ * ==============================================================================
+ * Google Drive 副本掃描專家 (6萬資料夾大容量版)
+ * 功能：自動索引目錄 -> 逐一比對副本 -> 顯示即時進度 -> Email 通知
+ * ==============================================================================
+ */
+
+// --- 介面設定 ---
+
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('🚀 雲端清理工具V6')
+    .addItem('▶️ 啟動一鍵自動化掃描', 'runAutomation')
+    .addSeparator()
+    .addItem('🧹 停止並重置進度', 'resetAllProgress')
+    .addToUi();
+}
+
+/**
+ * 啟動點
+ */
+function runAutomation() {
+  const props = PropertiesService.getScriptProperties();
+  
+  if (props.getProperty('IS_RUNNING') === 'true') {
+    SpreadsheetApp.getUi().alert("任務已在背景執行中，請檢視「StatusPanel」分頁。");
+    return;
+  }
+  
+  const ui = SpreadsheetApp.getUi();
+  const resp = ui.alert("將開始執行「全硬碟掃描」，預計處理 6 萬個資料夾。\n程式會自動接關，完成後發送 Email。\n是否啟動？", ui.ButtonSet.YES_NO);
+  
+  if (resp === ui.Button.YES) {
+    props.setProperty('IS_RUNNING', 'true');
+    updateStatus("啟動中", "準備開始任務...");
+    createNextTrigger(); // 設定自動接關
+    mainProcess(); // 啟動主程式
+  }
+}
+
+/**
+ * 主邏輯分配
+ */
+function mainProcess() {
+  const props = PropertiesService.getScriptProperties();
+  const isIndexed = props.getProperty('INDEX_COMPLETE');
+
+  try {
+    if (!isIndexed) {
+      runFolderIndexing();
+    } else {
+      runFileComparison();
+    }
+  } catch (e) {
+    console.error("執行異常: " + e.toString());
+    updateStatus("執行錯誤", e.toString());
+    // 遇到錯誤暫停執行，並將執行標記設為 false 以便使用者檢修
+    props.setProperty('IS_RUNNING', 'false');
+    deleteTriggers();
+  }
+}
+
+// --- 階段 1：目錄索引 ---
+
+function runFolderIndexing() {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty('INDEX_TOKEN');
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let indexSheet = ss.getSheetByName('FolderIndex') || ss.insertSheet('FolderIndex');
+  
+  if (!token && indexSheet.getLastRow() <= 1) {
+    indexSheet.clear().appendRow(['Folder ID', 'Folder Name']);
+    indexSheet.setFrozenRows(1);
+  }
+
+  let folders = token ? DriveApp.continueFolderIterator(token) : DriveApp.getFolders();
+  let startTime = new Date().getTime();
+  let cache = [];
+
+  while (folders.hasNext()) {
+    // 4分鐘中斷機制 (GAS 上限 6 分鐘，預留安全緩衝)
+    if (new Date().getTime() - startTime > 240000) {
+      saveToSheet(indexSheet, cache);
+      props.setProperty('INDEX_TOKEN', folders.getContinuationToken());
+      updateStatus("索引中", "已找到 " + indexSheet.getLastRow() + " 個資料夾，稍後接續...");
+      return; 
+    }
+
+    let folder = folders.next();
+    cache.push([folder.getId(), folder.getName()]);
+    
+    if (cache.length >= 500) {
+      saveToSheet(indexSheet, cache);
+      updateStatus("索引中", "正在掃描目錄...目前累計: " + indexSheet.getLastRow());
+      cache = [];
+    }
+  }
+
+  saveToSheet(indexSheet, cache);
+  props.deleteProperty('INDEX_TOKEN');
+  props.setProperty('INDEX_COMPLETE', 'true');
+  props.setProperty('CURRENT_ROW', '2');
+  updateStatus("索引完成", "目錄已全數掃描。即將進入檔案比對。");
+}
+
+// --- 階段 2：檔案比對 ---
+
+function runFileComparison() {
+  const props = PropertiesService.getScriptProperties();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const indexSheet = ss.getSheetByName('FolderIndex');
+  const resultSheet = ss.getSheetByName('副本比對清單V6') || ss.insertSheet('副本比對清單V6');
+  
+  if (resultSheet.getLastRow() === 0) {
+    resultSheet.appendRow(["狀態", "副本檔名", "原始檔名", "大小一致", "父資料夾路徑", "副本建立時間", "檔案連結"]);
+    resultSheet.setFrozenRows(1);
+  }
+
+  let currentRow = parseInt(props.getProperty('CURRENT_ROW') || '2');
+  const lastRow = indexSheet.getLastRow();
+  const startTime = new Date().getTime();
+
+  while (currentRow <= lastRow) {
+    // 4.5 分鐘中斷機制
+    if (new Date().getTime() - startTime > 270000) {
+      props.setProperty('CURRENT_ROW', currentRow.toString());
+      updateStatus("比對中", "目前進度: " + currentRow + " / " + lastRow);
+      return;
+    }
+
+    let folderId = indexSheet.getRange(currentRow, 1).getValue();
+    try {
+      let folder = DriveApp.getFolderById(folderId);
+      checkFilesInside(folder, resultSheet);
+    } catch (e) {
+      console.warn("跳過資料夾 ID: " + folderId + " (原因: " + e.message + ")");
+    }
+    
+    if (currentRow % 50 === 0) {
+      updateStatus("比對中", currentRow + " / " + lastRow);
+    }
+    currentRow++;
+  }
+
+  completeAllTask();
+}
+
+/**
+ * 副本比對邏輯 (同一資料夾內)
+ */
+function checkFilesInside(folder, sheet) {
+  const files = folder.getFiles();
+  const fileMap = {}; // 存放檔案名稱與大小的映射
+  const list = [];
+  
+  while (files.hasNext()) {
+    let f = files.next();
+    let n = f.getName();
+    list.push(f);
+    fileMap[n] = f.getSize();
+  }
+
+  list.forEach(f => {
+    let name = f.getName();
+    // 偵測 "(1)" 或 "的副本" 結尾
+    let match = name.match(/^(.*)\s\(\d+\)$/) || name.match(/^(.*) 的副本$/);
+    
+    if (match) {
+      let baseName = match[1];
+      // 檢查同目錄下是否存在原始檔名
+      if (fileMap[baseName] !== undefined) {
+        sheet.appendRow([
+          "重複副本", 
+          name, 
+          baseName, 
+          (f.getSize() === fileMap[baseName] ? "一致" : "不一致"),
+          folder.getName(), 
+          f.getDateCreated(), 
+          f.getUrl()
+        ]);
+      }
+    }
+  });
+}
+
+// --- 系統功能 ---
+
+function updateStatus(stage, detail) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let statusSheet = ss.getSheetByName('StatusPanel') || ss.insertSheet('StatusPanel');
+  
+  if (statusSheet.getLastRow() === 0) {
+    statusSheet.getRange("A1:B1").setValues([["項目", "數值"]]).setFontWeight("bold").setBackground("#f3f3f3");
+    statusSheet.getRange("A2:A6").setValues([["目前階段"], ["累計索引目錄"], ["目前比對目錄"], ["總進度 %"], ["最後更新時間"]]);
+    statusSheet.setColumnWidth(1, 150);
+    statusSheet.setColumnWidth(2, 400);
+  }
+  
+  const now = Utilities.formatDate(new Date(), "GMT+8", "yyyy-MM-dd HH:mm:ss");
+  if (stage) statusSheet.getRange("B2").setValue(stage);
+  if (detail) {
+    if (stage.includes("索引")) statusSheet.getRange("B3").setValue(detail);
+    if (stage.includes("比對")) statusSheet.getRange("B4").setValue(detail);
+  }
+  
+  if (stage === "比對中") {
+    const lastRow = ss.getSheetByName('FolderIndex').getLastRow() - 1;
+    const current = parseInt(detail.split(" / ")[0]);
+    statusSheet.getRange("B5").setValue(((current / lastRow) * 100).toFixed(2) + "%");
+  }
+  
+  statusSheet.getRange("B6").setValue(now);
+}
+
+function createNextTrigger() {
+  deleteTriggers();
+  ScriptApp.newTrigger('mainProcess')
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+}
+
+function deleteTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(t => ScriptApp.deleteTrigger(t));
+}
+
+function saveToSheet(sheet, data) {
+  if (data.length > 0) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, data.length, data[0].length).setValues(data);
+  }
+}
+
+function completeAllTask() {
+  const props = PropertiesService.getScriptProperties();
+  deleteTriggers();
+  props.setProperty('IS_RUNNING', 'false');
+  props.deleteProperty('INDEX_COMPLETE');
+  props.deleteProperty('CURRENT_ROW');
+  
+  updateStatus("✅ 任務完成", "所有資料夾掃描完畢");
+  
+  const email = Session.getActiveUser().getEmail();
+  MailApp.sendEmail(email, "Google Drive 副本掃描完成", "您好，雲端硬碟副本掃描任務已全部完成，請檢視試算表結果。");
+}
+
+function resetAllProgress() {
+  const props = PropertiesService.getScriptProperties();
+  deleteTriggers();
+  props.deleteAllProperties();
+  const ui = SpreadsheetApp.getUi();
+  ui.alert("進度已重置。若要重新掃描，請再次點選「啟動一鍵自動化掃描」。");
+}
