@@ -81,11 +81,20 @@ function runAutomation() {
     ui.ButtonSet.YES_NO);
   if (resp !== ui.Button.YES) return;
 
-  clearWorkingSheets();
-  props.deleteAllProperties();
-  props.setProperties({ IS_RUNNING: 'true', PHASE: 'SCAN', SCANNED: '0', ERROR_COUNT: '0' });
-  updateStatus('啟動中', '準備開始任務...');
-  createNextTrigger();
+  // 初始化期間持有鎖：舊版（V6）留下、或剛好觸發的排程會等初始化完成才進來，
+  // 不會在「屬性剛被清空、排程剛建好」的瞬間誤判任務沒在跑而把新排程刪掉。
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    deleteTriggers();
+    clearWorkingSheets();
+    props.deleteAllProperties();
+    props.setProperties({ IS_RUNNING: 'true', PHASE: 'SCAN', SCANNED: '0', ERROR_COUNT: '0' });
+    updateStatus('啟動中', '準備開始任務...');
+    createNextTrigger();
+  } finally {
+    lock.releaseLock();
+  }
   mainProcess();
 }
 
