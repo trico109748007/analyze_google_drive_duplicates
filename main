@@ -55,6 +55,8 @@ const MODE_MD5 = '內容相同 (MD5)';
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('🚀 雲端清理工具V7')
     .addItem('▶️ 啟動一鍵自動化掃描', 'runAutomation')
+    .addItem('⏯️ 手動接續一次', 'resumeManually')
+    .addItem('🔍 檢查執行狀態', 'showDiagnostics')
     .addSeparator()
     .addItem('🧹 停止並重置進度', 'resetAllProgress')
     .addToUi();
@@ -106,35 +108,43 @@ const PHASES = {
  * 時間還夠的話，會在同一次執行裡連續做下一個階段。
  */
 function mainProcess() {
+  const props = PropertiesService.getScriptProperties();
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(0)) {
-    console.log('上一個執行還在跑，本次略過。');
+  // 等一下再放棄：排程與手動執行剛好碰在一起時，不會因為差幾秒就整次略過
+  if (!lock.tryLock(10000)) {
+    noteRun('略過：上一個執行還在跑');
     return;
   }
 
-  const props = PropertiesService.getScriptProperties();
-  const ctx = {
-    props: props,
-    ss: SpreadsheetApp.getActiveSpreadsheet(),
-    deadline: Date.now() + CONFIG.TIME_LIMIT_MS
-  };
-
+  let ctx = null;
   try {
+    ctx = {
+      props: props,
+      ss: SpreadsheetApp.getActiveSpreadsheet(),
+      deadline: Date.now() + CONFIG.TIME_LIMIT_MS
+    };
+    noteRun('開始（' + (props.getProperty('PHASE') || '-') + '）');
+
     for (let i = 0; i < 10; i++) {
       if (props.getProperty('IS_RUNNING') !== 'true') {
         deleteTriggers();
+        noteRun('結束：任務未在執行中（IS_RUNNING=' + props.getProperty('IS_RUNNING') + '），已移除排程');
         break;
       }
       const phase = props.getProperty('PHASE') || 'SCAN';
       const handler = PHASES[phase];
-      if (!handler) break;
+      if (!handler) {
+        noteRun('結束：未知的階段 ' + phase);
+        break;
+      }
       if (!handler(ctx)) break;            // 時間到，等下次接續
       if (Date.now() > ctx.deadline) break;
     }
     props.setProperty('ERROR_COUNT', '0');
+    noteRun('正常結束（' + (props.getProperty('PHASE') || '完成') + '）');
   } catch (e) {
     const count = parseInt(props.getProperty('ERROR_COUNT') || '0', 10) + 1;
-    props.setProperty('ERROR_COUNT', String(count));
+    props.setProperties({ ERROR_COUNT: String(count), LAST_ERROR: String(e).slice(0, 500) });
     console.error('執行異常（第 ' + count + ' 次）: ' + e.stack);
 
     if (count >= CONFIG.MAX_ERRORS) {
@@ -146,8 +156,76 @@ function mainProcess() {
       // 暫時性錯誤（配額、網路）：保留排程，下次從同一個進度重試
       updateStatus('發生錯誤，稍後自動重試（' + count + '/' + CONFIG.MAX_ERRORS + '）', e.toString());
     }
+    noteRun('錯誤：' + e);
   } finally {
+    // 任務還沒完成卻沒有排程（被刪掉、建立失敗等）時，自動補建
+    try {
+      if (props.getProperty('IS_RUNNING') === 'true' && !hasTrigger()) {
+        createNextTrigger();
+        noteRun('偵測到排程不見了，已重新建立');
+      }
+    } catch (e) {
+      console.error('補建排程失敗: ' + e);
+    }
     lock.releaseLock();
+  }
+}
+
+/**
+ * 選單：不等排程，立刻接著跑一次（排程不見時也會補建）
+ */
+function resumeManually() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('IS_RUNNING') !== 'true') {
+    ui.alert('目前沒有進行中的任務（IS_RUNNING=' + props.getProperty('IS_RUNNING') + '）。\n請用「啟動一鍵自動化掃描」重新開始。');
+    return;
+  }
+  props.setProperty('ERROR_COUNT', '0');
+  mainProcess();
+}
+
+/**
+ * 選單：顯示任務狀態與排程，用來判斷為什麼沒有繼續
+ */
+function showDiagnostics() {
+  const props = PropertiesService.getScriptProperties().getProperties();
+  const triggers = ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'mainProcess');
+  const lines = [
+    '執行中 (IS_RUNNING)：' + (props.IS_RUNNING || '（未設定）'),
+    '目前階段 (PHASE)：' + (props.PHASE || '（未設定）'),
+    '已列出項目：' + (props.SCANNED || '0'),
+    '掃描接續點：' + (props.PAGE_TOKEN ? '有' : '無'),
+    '比對進度列 (CURSOR)：' + (props.CURSOR || '-'),
+    '連續錯誤次數：' + (props.ERROR_COUNT || '0'),
+    '最後錯誤：' + (props.LAST_ERROR || '（無）'),
+    '最後一次執行：' + (props.LAST_RUN || '（無紀錄）'),
+    'mainProcess 排程數量：' + triggers.length
+  ];
+  if (props.IS_RUNNING === 'true' && triggers.length === 0) {
+    lines.push('', '⚠️ 任務在執行中，但沒有排程。請按「手動接續一次」，會自動補建排程。');
+  }
+  SpreadsheetApp.getUi().alert(lines.join('\n'));
+}
+
+function hasTrigger() {
+  return ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'mainProcess');
+}
+
+/**
+ * 記錄每一次執行的結果（時間＋說明），寫到 Script Properties 與 StatusPanel 的「最後一次執行」。
+ * 用來分辨「排程根本沒觸發」與「有觸發但被略過」。
+ */
+function noteRun(text) {
+  try {
+    const now = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+    const line = now + '　' + text;
+    PropertiesService.getScriptProperties().setProperty('LAST_RUN', line);
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET.STATUS);
+    if (sheet) sheet.getRange('A7:B7').setValues([['最後一次執行', line]]);
+    console.log(line);
+  } catch (e) {
+    console.warn('noteRun 失敗: ' + e);
   }
 }
 
@@ -428,7 +506,7 @@ function runFinalize(ctx) {
   const fileSheet = ctx.ss.getSheetByName(SHEET.FILES);
   stats.files = fileSheet ? fileSheet.getLastRow() - 1 : 0;
   completeAllTask(stats);
-  return true;
+  return false; // 任務已完成，結束本次執行
 }
 
 // --- 檔名處理 ---
